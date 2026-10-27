@@ -211,7 +211,8 @@ def list_sessions(sessions_dir: Path) -> list[Session]:
     if not sessions_dir.is_dir():
         return []
     sessions = [Session.load(p) for p in sessions_dir.iterdir() if (p / SESSION_FILE).is_file()]
-    return sorted(sessions, key=lambda s: s.data.get("updated_at", ""))
+    # updated_at has one-second resolution; the file's mtime breaks ties between sessions saved in the same second.
+    return sorted(sessions, key=lambda s: (s.data.get("updated_at", ""), (s.path / SESSION_FILE).stat().st_mtime_ns))
 
 
 def resolve_session(sessions_dir: Path, key: str) -> Session:

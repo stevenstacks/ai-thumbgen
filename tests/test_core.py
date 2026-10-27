@@ -121,3 +121,13 @@ def test_overlay_logo_trims_and_positions():
 
     with pytest.raises(ThumbgenError):
         overlay_logo(bg, Image.new("RGBA", (10, 10), (0, 0, 0, 0)))
+
+
+def test_latest_session_breaks_same_second_ties(tmp_path, monkeypatch):
+    import ai_thumbgen.session as session_mod
+
+    monkeypatch.setattr(session_mod, "now_iso", lambda: "2026-01-01T00:00:00+00:00")
+    kwargs = dict(source={"kind": "refs-only", "base": None}, brief="b", game="", use_default_refs=True)
+    Session.create(tmp_path, "zzz first", **kwargs)
+    second = Session.create(tmp_path, "aaa second", **kwargs)  # sorts first by name, but was saved last
+    assert resolve_session(tmp_path, "latest").name == second.name
