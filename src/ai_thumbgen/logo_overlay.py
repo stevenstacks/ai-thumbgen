@@ -3,7 +3,7 @@ from __future__ import annotations
 from PIL import Image, ImageColor, ImageFilter
 
 from .errors import ThumbgenError
-from .text_overlay import POSITIONS
+from .text_overlay import FULL_AREA, check_pos, place
 
 
 def overlay_logo(
@@ -15,10 +15,10 @@ def overlay_logo(
     margin: float = 0.04,
     shadow: str | None = None,
     opacity: float = 1.0,
+    area: tuple[float, float, float, float] = FULL_AREA,
 ) -> Image.Image:
-    """Paste a logo pixel-exact (alpha kept). `width` is the logo width as a fraction of image width."""
-    if pos not in POSITIONS:
-        raise ThumbgenError(f"Unknown position '{pos}'. Choose one of: {', '.join(POSITIONS)}")
+    """Paste a logo pixel-exact (alpha kept) inside `area`. `width` is the logo width as a fraction of image width."""
+    check_pos(pos)
     if not 0 < width <= 1:
         raise ThumbgenError("--width must be between 0 and 1.")
     if not 0 < opacity <= 1:
@@ -33,17 +33,13 @@ def overlay_logo(
     mark = mark.crop(bbox)
     lw = max(1, int(W * width))
     lh = max(1, round(mark.height * lw / mark.width))
-    if lh > H:
+    if lh > H * (area[3] - area[1]):
         raise ThumbgenError("Logo is too tall at this --width; use a smaller value.")
     mark = mark.resize((lw, lh), Image.LANCZOS)
     if opacity < 1:
         mark.putalpha(mark.getchannel("A").point(lambda a: int(a * opacity)))
 
-    mx, my = int(W * margin), int(H * margin)
-    horiz = "left" if pos.endswith("left") else "right" if pos.endswith("right") else "center"
-    vert = "top" if pos.startswith("top") else "bottom" if pos.startswith("bottom") else "middle"
-    x = {"left": mx, "center": (W - lw) // 2, "right": W - mx - lw}[horiz]
-    y = {"top": my, "middle": (H - lh) // 2, "bottom": H - my - lh}[vert]
+    x, y = place((lw, lh), (W, H), pos, margin, area)
 
     if shadow:
         try:

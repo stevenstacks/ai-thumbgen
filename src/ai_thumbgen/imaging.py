@@ -6,14 +6,15 @@ from pathlib import Path
 
 from PIL import Image
 
-from .config import MAX_INPUT_BYTES, OUTPUT_SIZE, UPLOAD_MAX_BYTES, UPLOAD_SIZE
+from .config import MAX_INPUT_BYTES, UPLOAD_MAX_BYTES
 
 ALLOWED_INPUT_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 ASPECT_16_9 = 16 / 9
 
 
 def crop_to_aspect(img: Image.Image, aspect: float = ASPECT_16_9, crop_x: float = 0.5) -> Image.Image:
-    """Crop to `aspect`. For wide frames (21:9) `crop_x` picks the horizontal window: 0=left, 0.5=center, 1=right."""
+    """Crop to `aspect`. For frames wider than `aspect`, `crop_x` picks the horizontal window:
+    0=left, 0.5=center, 1=right. Taller frames are cropped around the vertical center."""
     if not 0.0 <= crop_x <= 1.0:
         raise ValueError("crop_x must be between 0.0 and 1.0")
     w, h = img.size
@@ -28,8 +29,9 @@ def crop_to_aspect(img: Image.Image, aspect: float = ASPECT_16_9, crop_x: float 
     return img.crop((0, top, w, top + new_h))
 
 
-def fit_16_9(img: Image.Image, size: tuple[int, int] = OUTPUT_SIZE, crop_x: float = 0.5) -> Image.Image:
-    img = crop_to_aspect(img.convert("RGB"), ASPECT_16_9, crop_x)
+def fit_size(img: Image.Image, size: tuple[int, int], crop_x: float = 0.5) -> Image.Image:
+    """Crop to the aspect ratio of `size`, then resize to exactly `size`."""
+    img = crop_to_aspect(img.convert("RGB"), size[0] / size[1], crop_x)
     if img.size != size:
         img = img.resize(size, Image.Resampling.LANCZOS)
     return img
@@ -38,11 +40,11 @@ def fit_16_9(img: Image.Image, size: tuple[int, int] = OUTPUT_SIZE, crop_x: floa
 def save_upload_jpeg(
     img: Image.Image,
     path: Path,
-    size: tuple[int, int] = UPLOAD_SIZE,
+    size: tuple[int, int] = (1280, 720),
     max_bytes: int = UPLOAD_MAX_BYTES,
 ) -> int:
-    """Save a YouTube-ready JPEG, lowering quality until it fits under `max_bytes`. Returns the quality used."""
-    img = fit_16_9(img, size)
+    """Save an upload-ready JPEG, lowering quality until it fits under `max_bytes`. Returns the quality used."""
+    img = fit_size(img, size)
     data = b""
     quality = 95
     for quality in range(95, 49, -5):

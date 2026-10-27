@@ -128,6 +128,86 @@ def test_logo_overlay(env):
     assert bad.exit_code != 0
 
 
+def test_tiktok_format(env):
+    root, fake, shot = env
+    out = run("new", "--image", str(shot), "--prompt", "PART 1", "--format", "tiktok", "--provider", "fake")
+    assert out["format"] == "tiktok"
+    req = fake.requests[-1]
+    assert req.size == (1152, 2048)
+    assert "TikTok cover" in req.prompt and "3:4" in req.prompt
+    with Image.open(req.images[0]) as im:
+        assert im.size == (1152, 2048)  # base frame cropped to 9:16
+    sizes = []
+    for path in out["uploads"]:
+        with Image.open(path) as im:
+            sizes.append(im.size)
+    assert sizes == [(1080, 1920), (1080, 1440)]
+
+    logo = root / "logo.png"
+    Image.new("RGBA", (200, 100), (255, 255, 255, 255)).save(logo)
+    out2 = run("logo", "--image", str(logo), "--pos", "top-right", "--margin", "0")
+    with Image.open(out2["image"]) as im:
+        assert im.getpixel((1150, 300)) == (255, 255, 255)  # just inside the 3:4 area (starts at y=256)
+        assert im.getpixel((1150, 250))[0] < 100  # top eighth stays clear
+
+    out3 = run("text", "--text", "PART 1", "--pos", "bottom-left")
+    assert out3["format"] == "tiktok"
+    run("edit", "latest", "--prompt", "more glow", "--provider", "fake")
+    assert fake.requests[-1].size == (1152, 2048) and "TikTok cover" in fake.requests[-1].prompt
+
+    dry = run("new", "--image", str(shot), "--prompt", "x", "--format", "tiktok", "--dry-run")
+    assert dry["size"] == "1152x2048"
+    bad = runner.invoke(app, ["new", "--image", str(shot), "--prompt", "x", "--format", "insta", "--json"])
+    assert bad.exit_code != 0
+
+
+def test_reference_sets(env, monkeypatch):
+    root, fake, shot = env
+    sifu = root / "references" / "sifu"
+    sifu.mkdir()
+    for i in range(3):
+        Image.new("RGB", (10, 10), (i, 50, 50)).save(sifu / f"s{i}.png")
+    (root / "references" / "elden").mkdir()
+    Image.new("RGB", (10, 10), (9, 9, 9)).save(root / "references" / "elden" / "e.png")
+
+    listed = run("refs")
+    assert {r["name"]: r["images"] for r in listed["ref_sets"]} == {"": 1, "elden": 1, "sifu": 3}
+
+    out = run("new", "--image", str(shot), "--prompt", "x", "--ref-set", "sifu", "--max-refs", "2",
+              "--provider", "fake")
+    req = fake.requests[-1]
+    assert [p.parent.name for p in req.images[1:]] == ["sifu", "sifu"]  # set only, capped at 2
+    assert run("show", "latest")["ref_set"] == "sifu"
+
+    run("edit", "latest", "--prompt", "y", "--provider", "fake")
+    assert len(fake.requests[-1].images) == 3  # set and limit kept for the session
+    run("edit", "latest", "--prompt", "z", "--ref-set", "elden", "--max-refs", "5", "--provider", "fake")
+    assert [p.name for p in fake.requests[-1].images[1:]] == ["e.png"]
+
+    monkeypatch.setenv("THUMBGEN_REFS", "sifu")
+    dry = run("new", "--image", str(shot), "--prompt", "x", "--dry-run")
+    assert dry["ref_set"] == "sifu" and len(dry["references_used"]) == 3
+
+    for bad in ("nope", "../x"):
+        result = runner.invoke(app, ["new", "--image", str(shot), "--prompt", "x", "--ref-set", bad, "--json"])
+        assert result.exit_code != 0
+    assert len(fake.requests) == 3 and out["version"] == "v1"
+
+
+def test_about_replaces_gameplay_wording(env, monkeypatch):
+    root, fake, shot = env
+    monkeypatch.setenv("THUMBGEN_GAME", "Sifu")
+    run("new", "--image", str(shot), "--prompt", "x", "--provider", "fake")
+    assert "gameplay screenshot from the video game Sifu" in fake.requests[-1].prompt
+
+    about = "a real phone video frame of a woman showing her outfit"
+    run("new", "--image", str(shot), "--prompt", "x", "--about", about, "--provider", "fake")
+    assert f"Image 1 is {about}." in fake.requests[-1].prompt
+    assert "gameplay" not in fake.requests[-1].prompt and "Sifu" not in fake.requests[-1].prompt
+    run("edit", "latest", "--prompt", "y", "--provider", "fake")
+    assert f"made from {about}" in fake.requests[-1].prompt and "Sifu" not in fake.requests[-1].prompt
+
+
 def test_invalid_model(env):
     result = runner.invoke(app, ["new", "--prompt", "x", "--model", "gpt-image-1", "--dry-run"])
     assert result.exit_code != 0

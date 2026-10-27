@@ -6,6 +6,7 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
+from .config import DEFAULT_FORMAT, Format, get_format
 from .errors import ThumbgenError
 from .imaging import file_sha1
 
@@ -43,18 +44,30 @@ class Session:
         brief: str,
         game: str,
         use_default_refs: bool,
+        fmt: str = DEFAULT_FORMAT,
+        ref_set: str = "",
+        max_refs: int | None = None,
+        about: str = "",
         persist: bool = True,
     ) -> "Session":
         stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         path = sessions_dir / f"{stamp}_{slugify(name)}"
+        i = 2
+        while path.exists():  # same name within the same second
+            path = sessions_dir / f"{stamp}_{slugify(name)}-{i}"
+            i += 1
         data = {
             "name": path.name,
             "created_at": now_iso(),
             "updated_at": now_iso(),
             "game": game,
+            "about": about,
+            "format": get_format(fmt).name,
             "source": source,
             "brief": brief,
             "use_default_refs": use_default_refs,
+            "ref_set": ref_set,
+            "max_refs": max_refs,
             "session_refs": [],
             "versions": [],
         }
@@ -87,6 +100,22 @@ class Session:
     @property
     def latest(self) -> dict | None:
         return self.versions[-1] if self.versions else None
+
+    @property
+    def format(self) -> Format:
+        return get_format(self.data.get("format"))  # sessions from before formats existed are YouTube
+
+    @property
+    def about(self) -> str:
+        return self.data.get("about", "")
+
+    @property
+    def ref_set(self) -> str:
+        return self.data.get("ref_set", "")  # older sessions used the top level of references/
+
+    @property
+    def max_refs(self) -> int | None:
+        return self.data.get("max_refs")
 
     @property
     def base_path(self) -> Path | None:

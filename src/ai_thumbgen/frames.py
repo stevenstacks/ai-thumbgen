@@ -132,10 +132,11 @@ def contact_sheet(
     *,
     cols: int = 4,
     thumb_width: int = 480,
+    aspect: float = ASPECT_16_9,
     ffmpeg: str | None = None,
     ffprobe: str | None = None,
 ) -> dict:
-    """Grid of frames with timestamp labels; dashed lines mark the centered 16:9 crop."""
+    """Grid of frames with timestamp labels; dashed lines mark the centered crop at `aspect`."""
     info = probe(video, ffprobe)
     duration = info["duration"]
     end = min(end, duration) if end is not None else duration
@@ -178,7 +179,7 @@ def contact_sheet(
         gap = 6
         sheet = Image.new("RGB", (cols * tw + (cols + 1) * gap, rows * th + (rows + 1) * gap), (20, 20, 20))
         font = load_font(None, max(14, th // 9))
-        crop_w = round(th * ASPECT_16_9)
+        crop_w = round(th * aspect)
         for i, (thumb, ts) in enumerate(zip(thumbs, times)):
             x = gap + (i % cols) * (tw + gap)
             y = gap + (i // cols) * (th + gap)

@@ -13,6 +13,31 @@ POSITIONS = (
     "bottom-left", "bottom", "bottom-right",
 )
 _WINDOWS_FALLBACK_FONTS = ("impact.ttf", "arialbd.ttf", "segoeuib.ttf")
+FULL_AREA = (0.0, 0.0, 1.0, 1.0)
+
+
+def check_pos(pos: str) -> None:
+    if pos not in POSITIONS:
+        raise ThumbgenError(f"Unknown position '{pos}'. Choose one of: {', '.join(POSITIONS)}")
+
+
+def place(
+    size: tuple[int, int],
+    canvas: tuple[int, int],
+    pos: str,
+    margin: float,
+    area: tuple[float, float, float, float] = FULL_AREA,
+) -> tuple[int, int]:
+    """Top-left corner for a box of `size` at `pos` inside `area` (fractions of the canvas), `margin` from its edges."""
+    w, h = size
+    W, H = canvas
+    ax0, ay0, ax1, ay1 = round(W * area[0]), round(H * area[1]), round(W * area[2]), round(H * area[3])
+    mx, my = int((ax1 - ax0) * margin), int((ay1 - ay0) * margin)
+    horiz = "left" if pos.endswith("left") else "right" if pos.endswith("right") else "center"
+    vert = "top" if pos.startswith("top") else "bottom" if pos.startswith("bottom") else "middle"
+    x = {"left": ax0 + mx, "center": (ax0 + ax1 - w) // 2, "right": ax1 - mx - w}[horiz]
+    y = {"top": ay0 + my, "middle": (ay0 + ay1 - h) // 2, "bottom": ay1 - my - h}[vert]
+    return x, y
 
 
 def find_font(explicit: Path | None, fonts_dir: Path | None) -> Path | None:
@@ -52,24 +77,21 @@ def overlay_text(
     glow: str | None = None,
     font_path: Path | None = None,
     margin: float = 0.05,
+    area: tuple[float, float, float, float] = FULL_AREA,
 ) -> Image.Image:
-    """Draw bold thumbnail text. `size` is the font size as a fraction of image height."""
-    if pos not in POSITIONS:
-        raise ThumbgenError(f"Unknown position '{pos}'. Choose one of: {', '.join(POSITIONS)}")
+    """Draw bold thumbnail text inside `area`. `size` is the font size as a fraction of the shorter image side."""
+    check_pos(pos)
     base = img.convert("RGBA")
     W, H = base.size
-    font_size = max(8, int(H * size))
+    font_size = max(8, int(min(W, H) * size))
     font = load_font(font_path, font_size)
     sw = max(1, int(font_size * stroke_ratio)) if stroke else 0
     text = text.replace("\\n", "\n")
     align = "left" if pos.endswith("left") else "right" if pos.endswith("right") else "center"
 
     l, t, r, b = ImageDraw.Draw(base).multiline_textbbox((0, 0), text, font=font, stroke_width=sw, align=align)
-    tw, th = r - l, b - t
-    mx, my = int(W * margin), int(H * margin)
-    vert = "top" if pos.startswith("top") else "bottom" if pos.startswith("bottom") else "middle"
-    x = {"left": mx, "center": (W - tw) // 2, "right": W - mx - tw}[align] - l
-    y = {"top": my, "middle": (H - th) // 2, "bottom": H - my - th}[vert] - t
+    x, y = place((r - l, b - t), (W, H), pos, margin, area)
+    x, y = x - l, y - t
 
     if glow:
         layer = Image.new("RGBA", base.size, (0, 0, 0, 0))

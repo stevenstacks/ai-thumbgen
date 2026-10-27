@@ -11,13 +11,16 @@ import typer
 from PIL import Image
 
 from . import frames as fr
-from .config import MAX_INPUT_IMAGES, OUTPUT_SIZE, Settings, load_settings, validate_model, validate_quality
+from .config import (
+    DEFAULT_FORMAT, FORMATS, MAX_INPUT_IMAGES, Settings, get_format, load_settings, validate_max_refs, validate_model,
+    validate_quality,
+)
 from .errors import ThumbgenError
-from .imaging import crop_to_aspect, fit_16_9, prepare_input_image, save_upload_jpeg
+from .imaging import crop_to_aspect, fit_size, prepare_input_image, save_upload_jpeg
 from .logo_overlay import overlay_logo
 from .prompts import build_edit_prompt, build_initial_prompt
 from .providers import PROVIDERS, EditRequest, get_provider
-from .references import select_references
+from .references import list_ref_sets, ref_set_dir, select_references
 from .session import Session, list_sessions, normalize_version_id, now_iso, resolve_session, slugify
 from .text_overlay import POSITIONS, find_font, overlay_text
 
@@ -25,7 +28,7 @@ app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
     pretty_exceptions_enable=False,
-    help="YouTube thumbnail generator: gameplay frame -> 16:9 -> AI edit, with versioned iterations.",
+    help="Thumbnail generator for YouTube and TikTok: gameplay frame -> AI edit, with versioned iterations.",
 )
 
 JsonFlag = Annotated[bool, typer.Option("--json", help="Print machine-readable JSON to stdout.")]
@@ -41,6 +44,14 @@ ProviderOpt = Annotated[str, typer.Option("--provider", help=f"Image provider: {
 DryRunOpt = Annotated[bool, typer.Option("--dry-run", help="Show the prompt and images without calling the API.")]
 SessionArg = Annotated[str, typer.Argument(help="Session name, unique prefix/substring, or 'latest'.")]
 FromOpt = Annotated[Optional[str], typer.Option("--from", help="Version to start from, e.g. v2 (default: latest).")]
+RefSetOpt = Annotated[
+    Optional[str],
+    typer.Option("--ref-set", help="Subfolder of references/ to use as style refs ('' = top level; default: .env)."),
+]
+MaxRefsOpt = Annotated[Optional[int], typer.Option("--max-refs", help="Send at most N reference images.")]
+FormatOpt = Annotated[
+    str, typer.Option("--format", help=f"Output format: {' | '.join(FORMATS)} (youtube 16:9, tiktok 9:16 cover).")
+]
 
 
 # ---------------------------------------------------------------- helpers
@@ -75,9 +86,13 @@ def _rel(session: Session, p: Path) -> str:
         return str(p)
 
 
-def _plan_images(settings: Settings, target: Optional[Path], session_refs: list[Path], use_defaults: bool):
+def _plan_images(
+    target: Optional[Path], session_refs: list[Path], default_dir: Optional[Path], max_refs: Optional[int]
+):
     slots = MAX_INPUT_IMAGES - (1 if target else 0)
-    sel = select_references(session_refs, settings.references_dir if use_defaults else None, slots)
+    if max_refs is not None:
+        slots = min(slots, max_refs)
+    sel = select_references(session_refs, default_dir, slots)
     images = ([target] if target else []) + sel.used
     if not images:
         raise ThumbgenError(
@@ -102,17 +117,22 @@ def _history(session: Session, parent_id: str) -> list[str]:
 
 
 def _save_version_files(session: Session, vid: str, img: Image.Image) -> dict:
+    fmt = session.format
     api_size = list(img.size)
-    archive = fit_16_9(img, OUTPUT_SIZE)
+    archive = fit_size(img, fmt.api_size)
     archive_path = session.file(f"{vid}.png")
-    upload_path = session.file(f"{vid}_1280x720.jpg")
     archive.save(archive_path, "PNG", optimize=True)
-    jpeg_quality = save_upload_jpeg(archive, upload_path)
+    uploads, qualities = [], []
+    for w, h in fmt.uploads:
+        upload_path = session.file(f"{vid}_{w}x{h}.jpg")
+        qualities.append(save_upload_jpeg(archive, upload_path, (w, h)))
+        uploads.append(upload_path.name)
     return {
         "image": archive_path.name,
-        "upload": upload_path.name,
+        "upload": uploads[0],
+        "uploads": uploads,
         "returned_size": api_size,
-        "upload_jpeg_quality": jpeg_quality,
+        "upload_jpeg_quality": qualities[0],
     }
 
 
@@ -124,15 +144,16 @@ def _version_result(session: Session, v: dict, warnings: list[str]) -> tuple[dic
         "parent": v.get("parent"),
         "image": str(session.file(v["image"])),
         "upload": str(session.file(v["upload"])),
+        "uploads": [str(session.file(u)) for u in v.get("uploads", [v["upload"]])],
+        "format": session.format.name,
         "warnings": warnings,
     }
     lines = [
-        f"session: {session.name}",
+        f"session: {session.name} ({session.format.name})",
         f"created {v['id']} (parent: {v.get('parent') or '-'}, {v['kind']}"
         + (f", {v['model']}/{v['quality']})" if v["kind"] == "ai" else ")"),
         f"  archive: {data['image']}",
-        f"  upload : {data['upload']}",
-    ]
+    ] + [f"  upload : {u}" for u in data["uploads"]]
     return data, lines
 
 
@@ -153,7 +174,9 @@ def _run_ai(
     provider = get_provider(provider_name)
     inputs = [prepare_input_image(p, session.path / ".inputs") for p in images]
     print(f"calling {provider_name}/{model} (quality={quality}, {len(inputs)} image(s))...", file=sys.stderr)
-    result = provider.edit(EditRequest(prompt=prompt, images=inputs, model=model, quality=quality, size=OUTPUT_SIZE))
+    result = provider.edit(
+        EditRequest(prompt=prompt, images=inputs, model=model, quality=quality, size=session.format.api_size)
+    )
     vid = session.next_version_id()
     with Image.open(io.BytesIO(result.image_bytes)) as img:
         files = _save_version_files(session, vid, img)
@@ -176,14 +199,17 @@ def _run_ai(
     return entry
 
 
-def _dry_run_data(session_name: str, prompt: str, images: list[Path], sel, model: str, quality: str, extra: dict):
+def _dry_run_data(session: Session, prompt: str, images: list[Path], sel, model: str, quality: str, extra: dict):
+    w, h = session.format.api_size
     return {
         "dry_run": True,
-        "session": session_name,
+        "session": session.name,
+        "format": session.format.name,
         "model": model,
         "quality": quality,
-        "size": f"{OUTPUT_SIZE[0]}x{OUTPUT_SIZE[1]}",
+        "size": f"{w}x{h}",
         "images": [str(p) for p in images],
+        "ref_set": session.ref_set,
         "references_used": [str(p) for p in sel.used],
         "references_dropped": [str(p) for p in sel.dropped],
         "prompt": prompt,
@@ -207,18 +233,21 @@ def frame(
     at: Annotated[str, typer.Option("--at", "-t", help="Timestamp, e.g. 00:12:34.5 or 754.5")],
     crop_x: Annotated[float, typer.Option(help="Horizontal crop position 0..1 (0.5 = center).")] = 0.5,
     no_crop: Annotated[bool, typer.Option("--no-crop", help="Keep the original aspect ratio.")] = False,
+    fmt: FormatOpt = DEFAULT_FORMAT,
     out: Annotated[Optional[Path], typer.Option(help="Output PNG path.")] = None,
     as_json: JsonFlag = False,
 ):
-    """Extract one frame (cropped to 16:9) for preview or for `new --image`. Free, no API call."""
+    """Extract one frame (cropped to the format's aspect ratio) for preview or for `new --image`. Free."""
     s = load_settings()
+    aspect = get_format(fmt).aspect
     info = fr.probe(video, s.ffprobe)
     seconds = fr.parse_timestamp(at)
     stamp = fr.format_timestamp(seconds).replace(":", "-")
-    out = out or s.frames_dir / f"{slugify(video.stem)}_{stamp}.png"
+    suffix = "" if fmt == DEFAULT_FORMAT else f"_{fmt}"
+    out = out or s.frames_dir / f"{slugify(video.stem)}_{stamp}{suffix}.png"
     warnings = fr.extract_frame(video, seconds, out, hdr=info["hdr"], ffmpeg=s.ffmpeg)
     with Image.open(out) as img:
-        result = img.convert("RGB") if no_crop else crop_to_aspect(img.convert("RGB"), crop_x=crop_x)
+        result = img.convert("RGB") if no_crop else crop_to_aspect(img.convert("RGB"), aspect, crop_x)
         result.save(out, "PNG")
         size = result.size
     data = {"path": str(out.resolve()), "size": list(size), "timestamp": fr.format_timestamp(seconds),
@@ -233,6 +262,7 @@ def frames(
     end: Annotated[Optional[str], typer.Option("--to", help="Range end (default: end of video).")] = None,
     every: Annotated[str, typer.Option(help="Interval, e.g. 10s, 0.5m.")] = "30s",
     cols: Annotated[int, typer.Option(help="Columns in the grid.")] = 4,
+    fmt: FormatOpt = DEFAULT_FORMAT,
     out: Annotated[Optional[Path], typer.Option(help="Output JPG path.")] = None,
     as_json: JsonFlag = False,
 ):
@@ -243,7 +273,8 @@ def frames(
     step = fr.parse_timestamp(every)
     name = f"{slugify(video.stem)}_{fr.format_timestamp(t0).replace(':', '-')[:8]}_sheet.jpg"
     out = out or s.frames_dir / name
-    data = fr.contact_sheet(video, t0, t1, step, out, cols=cols, ffmpeg=s.ffmpeg, ffprobe=s.ffprobe)
+    data = fr.contact_sheet(video, t0, t1, step, out, cols=cols, aspect=get_format(fmt).aspect,
+                            ffmpeg=s.ffmpeg, ffprobe=s.ffprobe)
     data["path"] = str(Path(data["path"]).resolve())
     _emit(as_json, data, [f"contact sheet: {data['path']} ({len(data['timestamps'])} frames)"])
 
@@ -258,8 +289,16 @@ def new(
     image: Annotated[Optional[Path], typer.Option("--image", "-i", help="Base image (screenshot).")] = None,
     ref: RefOpt = None,
     no_default_refs: Annotated[bool, typer.Option("--no-default-refs", help="Skip references/ for this run.")] = False,
+    ref_set: RefSetOpt = None,
+    max_refs: MaxRefsOpt = None,
+    about: Annotated[
+        str,
+        typer.Option("--about", help="What the base image shows, for non-game content "
+                     "(e.g. 'a real phone video frame of a woman showing her outfit'). Default: gameplay of THUMBGEN_GAME."),
+    ] = "",
     name: Annotated[Optional[str], typer.Option(help="Session name (default: from prompt).")] = None,
     crop_x: Annotated[float, typer.Option(help="Horizontal crop position 0..1 (0.5 = center).")] = 0.5,
+    fmt: FormatOpt = DEFAULT_FORMAT,
     model: ModelOpt = None,
     quality: QualityOpt = None,
     provider: ProviderOpt = "openai",
@@ -272,6 +311,7 @@ def new(
     """
     s = load_settings()
     model, quality = _model_quality(s, model, quality)
+    fmt = get_format(fmt).name
     if video and image:
         raise ThumbgenError("Use either --video or --image, not both.")
     if video and not at:
@@ -280,6 +320,9 @@ def new(
         raise ThumbgenError("--at needs --video.")
     manual_refs = _existing_files(ref, "Reference")
     use_defaults = not no_default_refs
+    ref_set = s.ref_set if ref_set is None else ref_set.strip()
+    default_dir = ref_set_dir(s.references_dir, ref_set) if use_defaults else None
+    max_refs = s.max_refs if max_refs is None else validate_max_refs(max_refs)
 
     warnings: list[str] = []
     if video:
@@ -298,18 +341,20 @@ def new(
 
     session = Session.create(
         s.sessions_dir, name or " ".join(prompt.split()[:6]),
-        source=source, brief=prompt, game=s.game, use_default_refs=use_defaults, persist=not dry_run,
+        source=source, brief=prompt, game=s.game, use_default_refs=use_defaults, fmt=fmt,
+        ref_set=ref_set, max_refs=max_refs, about=about.strip(), persist=not dry_run,
     )
     target = session.base_path
 
     if dry_run:
-        images, sel = _plan_images(s, target, manual_refs, use_defaults)
-        full_prompt = build_initial_prompt(s.game, prompt, has_base=target is not None, n_refs=len(sel.used))
-        data = _dry_run_data(session.name, full_prompt, images, sel, model, quality, {"source": source})
+        images, sel = _plan_images(target, manual_refs, default_dir, max_refs)
+        full_prompt = build_initial_prompt(s.game, prompt, session.format, has_base=target is not None, n_refs=len(sel.used),
+            about=session.about)
+        data = _dry_run_data(session, full_prompt, images, sel, model, quality, {"source": source})
         _emit(as_json, data, _dry_run_lines(data))
         return
 
-    # Build base.png (16:9, 2048x1152) from the source.
+    # Build base.png (the format's API size) from the source.
     if source["kind"] == "video":
         frame_path = session.file("source_frame.png")
         warnings += fr.extract_frame(video, seconds, frame_path, hdr=info["hdr"], ffmpeg=s.ffmpeg)
@@ -318,12 +363,13 @@ def new(
         src_img_path = image
     if target is not None:
         with Image.open(src_img_path) as img:
-            fit_16_9(img, OUTPUT_SIZE, crop_x).save(target, "PNG")
+            fit_size(img, session.format.api_size, crop_x).save(target, "PNG")
 
     session.add_refs(manual_refs)
     session.save()
-    images, sel = _plan_images(s, target, session.ref_paths(), use_defaults)
-    full_prompt = build_initial_prompt(s.game, prompt, has_base=target is not None, n_refs=len(sel.used))
+    images, sel = _plan_images(target, session.ref_paths(), default_dir, max_refs)
+    full_prompt = build_initial_prompt(s.game, prompt, session.format, has_base=target is not None, n_refs=len(sel.used),
+            about=session.about)
     try:
         v = _run_ai(s, session, parent_id=None, instruction=prompt, prompt=full_prompt, images=images,
                     refs=sel.used, model=model, quality=quality, provider_name=provider, initial=True)
@@ -348,6 +394,12 @@ def edit(
         Optional[bool],
         typer.Option("--default-refs/--no-default-refs", help="Include references/ for this run (default: as in `new`)."),
     ] = None,
+    ref_set: Annotated[
+        Optional[str], typer.Option("--ref-set", help="Switch this session to another reference set (kept).")
+    ] = None,
+    max_refs: Annotated[
+        Optional[int], typer.Option("--max-refs", help="Change this session's reference limit (kept).")
+    ] = None,
     model: ModelOpt = None,
     quality: QualityOpt = None,
     provider: ProviderOpt = "openai",
@@ -360,6 +412,11 @@ def edit(
     session = resolve_session(s.sessions_dir, session_key)
     new_refs = _existing_files(ref, "Reference")
     use_defaults = session.data["use_default_refs"] if default_refs is None else default_refs
+    ref_set = session.ref_set if ref_set is None else ref_set.strip()
+    default_dir = ref_set_dir(s.references_dir, ref_set) if use_defaults else None
+    max_refs = session.max_refs if max_refs is None else validate_max_refs(max_refs)
+    if not dry_run:
+        session.data["ref_set"], session.data["max_refs"] = ref_set, max_refs
 
     if from_:
         parent = session.version(from_)
@@ -382,21 +439,23 @@ def edit(
     if parent is None:
         # Session without versions (e.g. first API call failed): run the initial generation with this prompt.
         target = session.base_path
-        images, sel = _plan_images(s, target, session_refs, use_defaults)
-        full_prompt = build_initial_prompt(s.game, prompt, has_base=target is not None, n_refs=len(sel.used))
+        images, sel = _plan_images(target, session_refs, default_dir, max_refs)
+        full_prompt = build_initial_prompt(s.game, prompt, session.format, has_base=target is not None, n_refs=len(sel.used),
+            about=session.about)
         parent_id, initial = None, True
         if not dry_run:
             session.data["brief"] = prompt
     else:
         target = session.file(parent["image"])
-        images, sel = _plan_images(s, target, session_refs, use_defaults)
+        images, sel = _plan_images(target, session_refs, default_dir, max_refs)
         full_prompt = build_edit_prompt(
-            s.game, session.data["brief"], _history(session, parent["id"]), prompt, n_refs=len(sel.used)
+            s.game, session.data["brief"], session.format, _history(session, parent["id"]), prompt,
+            n_refs=len(sel.used), about=session.about,
         )
         parent_id, initial = parent["id"], False
 
     if dry_run:
-        data = _dry_run_data(session.name, full_prompt, images, sel, model, quality, {"parent": parent_id})
+        data = _dry_run_data(session, full_prompt, images, sel, model, quality, {"parent": parent_id})
         _emit(as_json, data, _dry_run_lines(data))
         return
 
@@ -412,7 +471,7 @@ def text(
     session_key: SessionArg = "latest",
     from_: FromOpt = None,
     pos: Annotated[str, typer.Option(help=" | ".join(POSITIONS))] = "top-left",
-    size: Annotated[float, typer.Option(help="Font size as a fraction of image height.")] = 0.18,
+    size: Annotated[float, typer.Option(help="Font size as a fraction of the shorter image side.")] = 0.18,
     color: Annotated[str, typer.Option(help="Text color.")] = "#ffffff",
     stroke: Annotated[str, typer.Option(help="Outline color.")] = "#000000",
     no_stroke: Annotated[bool, typer.Option("--no-stroke", help="No outline.")] = False,
@@ -435,7 +494,8 @@ def text(
     with Image.open(session.file(parent["image"])) as img:
         try:
             result = overlay_text(img, text_, pos=pos, size=size, color=color, stroke=params["stroke"],
-                                  stroke_ratio=stroke_ratio, glow=glow, font_path=font_path, margin=margin)
+                                  stroke_ratio=stroke_ratio, glow=glow, font_path=font_path, margin=margin,
+                                  area=session.format.safe_area)
         except ValueError as e:
             raise ThumbgenError(f"Invalid text option: {e}") from None
     vid = session.next_version_id()
@@ -475,7 +535,8 @@ def logo(
     params = {"image": str(logo_path), "pos": pos, "width": width, "margin": margin, "shadow": shadow,
               "opacity": opacity}
     with Image.open(session.file(parent["image"])) as img, Image.open(logo_path) as mark:
-        result = overlay_logo(img, mark, pos=pos, width=width, margin=margin, shadow=shadow, opacity=opacity)
+        result = overlay_logo(img, mark, pos=pos, width=width, margin=margin, shadow=shadow, opacity=opacity,
+                              area=session.format.safe_area)
     vid = session.next_version_id()
     entry = {
         "id": vid,
@@ -491,6 +552,18 @@ def logo(
     _emit(as_json, data, lines)
 
 
+@app.command()
+def refs(as_json: JsonFlag = False):
+    """List reference sets (subfolders of references/) and how many images each holds."""
+    s = load_settings()
+    sets = list_ref_sets(s.references_dir)
+    rows = [{"name": n, "path": str(ref_set_dir(s.references_dir, n)), "images": c, "default": n == s.ref_set}
+            for n, c in sets.items()]
+    lines = [f"{'*' if r['default'] else ' '} {r['name'] or '(top level)'}  {r['images']} image(s)  {r['path']}"
+             for r in rows] or [f"(no references folder at {s.references_dir})"]
+    _emit(as_json, {"ref_sets": rows, "default": s.ref_set}, lines)
+
+
 @app.command("list")
 def list_cmd(as_json: JsonFlag = False):
     """List sessions (oldest first, most recently updated last)."""
@@ -502,12 +575,13 @@ def list_cmd(as_json: JsonFlag = False):
         rows.append({
             "name": ses.name,
             "source": ses.data["source"]["kind"],
+            "format": ses.format.name,
             "versions": len(ses.versions),
             "latest": latest["id"] if latest else None,
             "updated_at": ses.data["updated_at"],
             "brief": ses.data["brief"],
         })
-    lines = [f"{r['name']}  [{r['source']}]  {r['versions']} version(s), latest {r['latest'] or '-'}"
+    lines = [f"{r['name']}  [{r['format']}, {r['source']}]  {r['versions']} version(s), latest {r['latest'] or '-'}"
              f"  ·  {r['updated_at']}\n    {r['brief'][:90]}" for r in rows] or ["(no sessions)"]
     _emit(as_json, {"sessions": rows}, lines)
 
@@ -527,11 +601,15 @@ def show(session_key: SessionArg = "latest", as_json: JsonFlag = False):
 
     lines = [
         f"session: {session.name}",
+        f"format : {session.format.name}",
+        f"about  : {session.about or ('gameplay of ' + (session.data.get('game') or 'a video game'))}",
         f"source : {session.data['source']['kind']}"
         + (f"  {session.data['source'].get('path', '')} {session.data['source'].get('timestamp', '')}".rstrip()),
         f"brief  : {session.data['brief']}",
         "refs   : " + (", ".join(p.name for p in session.ref_paths()) or "-")
-        + f"  (default refs: {'on' if session.data['use_default_refs'] else 'off'})",
+        + f"  (default refs: {'on' if session.data['use_default_refs'] else 'off'}"
+        + f", set: {session.ref_set or '(top level)'}"
+        + (f", max {session.max_refs}" if session.max_refs is not None else "") + ")",
         f"folder : {session.path}",
         "",
     ]
