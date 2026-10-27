@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-thumbgen"
+version = "0.1.0"
+description = "CLI YouTube thumbnail generator: gameplay frame -> 16:9 -> AI image edit with versioned iterations"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Steven Sean Surjadi" }]
+keywords = ["youtube", "thumbnail", "openai", "gpt-image", "cli", "gaming", "ffmpeg"]
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=2.0",
+    "pillow>=10.4",
+    "python-dotenv>=1.0",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.urls]
+Repository = "https://github.com/stevenstacks/ai-thumbgen"
+
+[project.scripts]
+ai-thumbgen = "ai_thumbgen.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

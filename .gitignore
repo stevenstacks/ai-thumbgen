@@ -1,0 +1,37 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# your own media and generated files
+output/
+references/*
+!references/.gitkeep
+fonts/*
+!fonts/.gitkeep
+
+# personal Claude Code notes and settings
+CLAUDE.local.md
+.claude/settings.local.json
+
+# python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
